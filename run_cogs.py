@@ -1,5 +1,7 @@
+from httpx import get
 from utils.train_utils import *
 from datetime import date
+import torch
 import json
 
 if __name__ == '__main__':
@@ -102,7 +104,7 @@ for lf in args.lfs.split(";"):
 
         model_name = args.model_name
         run_name = f"cogs_pipeline.model.{model_name}.lf.{args.lf}.glove.{args.use_glove}.seed.{seed}"
-        if args.do_train == False:
+        if args.do_train == False and not args.model_path:
             args.model_path = f"./{args.output_dir}/{run_name}/model-last/"
         
         logger = logging.getLogger()
@@ -142,16 +144,18 @@ for lf in args.lfs.split(";"):
                 max_seq_len=args.max_seq_len
             )  
         else:
-            src_tokenizer = WordLevelTokenizer(
-                os.path.join(args.model_data_path, "src_vocab.txt"), 
-                config_encoder,
-                max_seq_len=args.max_seq_len
-            )
-            tgt_tokenizer = WordLevelTokenizer(
-                os.path.join(args.model_data_path, "tgt_vocab.txt"), 
-                config_decoder,
-                max_seq_len=args.max_seq_len
-            )
+            # src_tokenizer = WordLevelTokenizer(
+            #     os.path.join(args.model_data_path, "src_vocab.txt"), 
+            #     config_encoder,
+            #     max_seq_len=args.max_seq_len
+            # )
+            # tgt_tokenizer = WordLevelTokenizer(
+            #     os.path.join(args.model_data_path, "tgt_vocab.txt"), 
+            #     config_decoder,
+            #     max_seq_len=args.max_seq_len
+            # )
+            src_tokenizer = get_tokenizer(os.path.join(args.model_data_path, "src_vocab.txt"))
+            tgt_tokenizer = get_tokenizer(os.path.join(args.model_data_path, "tgt_vocab.txt"))
 
         if args.least_to_most:
             logging.info("Preparing training set to be least to most order.")
@@ -281,7 +285,8 @@ for lf in args.lfs.split(";"):
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 save_after_epoch=args.save_after_epoch,
             )
-        
+
+        test_acc = 0
         if args.do_test:
             trainer.model.eval()
             epoch_iterator = tqdm(test_dataloader, desc="Iteration", position=0, leave=True)
@@ -324,111 +329,121 @@ for lf in args.lfs.split(";"):
 
         if args.do_gen:
             # TODO: potentially do bootstrap? and report once?
-            gen_dataset = COGSDataset(
-                cogs_path=args.data_path, 
-                src_tokenizer=src_tokenizer, 
-                tgt_tokenizer=tgt_tokenizer, 
-                partition=find_partition_name("gen", args.lf),
-            )
-            gen_dataloader = DataLoader(
-                gen_dataset, batch_size=args.eval_batch_size, 
-                sampler=SequentialSampler(gen_dataset),
-                collate_fn=train_dataset.collate_batch
-            )
+            # gen_dataset = COGSDataset(
+            #     cogs_path=args.data_path, 
+            #     src_tokenizer=src_tokenizer, 
+            #     tgt_tokenizer=tgt_tokenizer, 
+            #     partition=find_partition_name("gen", args.lf),
+            # )
+            gen_df = pd.read_csv(
+                args.data_path + "/gen.tsv",
+                delimiter="\t",
+                names=['input', 'output', 'category'])
+            result = eval(gen_df, trainer, args.eval_batch_size)
+            # gen_dataloader = DataLoader(
+            #     gen_dataset, batch_size=args.eval_batch_size, 
+            #     sampler=SequentialSampler(gen_dataset),
+            #     collate_fn=train_dataset.collate_batch,
+            #     pin_memory=True,
+            # )
             
-            per_cat_eval = {}
-            for cat in set(gen_dataset.eval_cat):
-                per_cat_eval[cat] = [0, 0] # correct, total
-            trainer.model.eval()
-            epoch_iterator = tqdm(gen_dataloader, desc="Iteration", position=0, leave=True)
-            total_count = 0
-            correct_count = 0
-            for step, inputs in enumerate(epoch_iterator):
-                input_ids = inputs["input_ids"].to(device)
-                attention_mask = inputs["attention_mask"].to(device)
-                labels = inputs["labels"].to(device)
-                if model_name == "ende_lstm":
-                    outputs = trainer.model.generate(
-                        input_ids,
-                        attention_mask=attention_mask,
-                    )
-                else:
-                    outputs = trainer.model.generate(
-                        input_ids,
-                        attention_mask=attention_mask,
-                        eos_token_id=model_config.eos_token_id,
-                        max_length=args.max_seq_len,
-                    )
-                decoded_preds = tgt_tokenizer.batch_decode(outputs)
-                decoded_labels = tgt_tokenizer.batch_decode(labels)
+            # per_cat_eval = {}
+            # for cat in set(gen_dataset.eval_cat):
+            #     per_cat_eval[cat] = [0, 0] # correct, total
+            # trainer.model.eval()
+            # epoch_iterator = tqdm(gen_dataloader, desc="Iteration", position=0, leave=True)
+            # total_count = 0
+            # correct_count = 0
+            # with torch.no_grad():
+            #     for step, inputs in enumerate(epoch_iterator):
+            #         input_ids = inputs["input_ids"].to(device)
+            #         attention_mask = inputs["attention_mask"].to(device)
+            #         labels = inputs["labels"].to(device)
+            #         print(input_ids.shape, attention_mask.shape)
+            #         if model_name == "ende_lstm":
+            #             outputs = trainer.model.generate(
+            #                 input_ids,
+            #                 attention_mask=attention_mask,
+            #             )
+            #         else:
+            #             outputs = trainer.model.generate(
+            #                 input_ids,
+            #                 attention_mask=attention_mask,
+            #                 eos_token_id=model_config.eos_token_id,
+            #                 max_length=args.max_seq_len,
+            #             )
+            #         decoded_preds = tgt_tokenizer.batch_decode(outputs)
+            #         decoded_labels = tgt_tokenizer.batch_decode(labels)
 
-                input_labels = src_tokenizer.batch_decode(input_ids)
-                for i in range(len(decoded_preds)):
-                    cat = gen_dataset.eval_cat[total_count]
-                    if args.use_iiem:
-                        eq = check_set_equal_neoD(decoded_labels[i], decoded_preds[i])
-                    else:
-                        eq = check_equal(decoded_labels[i], decoded_preds[i])
-                    if eq:
-                        correct_count += 1
-                        per_cat_eval[cat][0] += 1
-                    else:
-                        if cat == "prim_to_obj_proper":
-                            pass
-                            # print("input: ", input_labels[i])
-                            # print("pred: ", decoded_preds[i])
-                            # print("actual: ", decoded_labels[i])
-                            # print("cat: ", cat)
-                            # print()
-                    total_count += 1
-                    per_cat_eval[cat][1] += 1
-                current_acc = correct_count/total_count
-                epoch_iterator.set_postfix({'acc': current_acc})
+            #         input_labels = src_tokenizer.batch_decode(input_ids)
+            #         for i in range(len(decoded_preds)):
+            #             cat = gen_dataset.eval_cat[total_count]
+            #             if args.use_iiem:
+            #                 eq = check_set_equal_neoD(decoded_labels[i], decoded_preds[i])
+            #             else:
+            #                 eq = check_equal(decoded_labels[i], decoded_preds[i])
+            #             if eq:
+            #                 correct_count += 1
+            #                 per_cat_eval[cat][0] += 1
+            #             else:
+            #                 if cat == "prim_to_obj_proper":
+            #                     pass
+            #                     # print("input: ", input_labels[i])
+            #                     # print("pred: ", decoded_preds[i])
+            #                     # print("actual: ", decoded_labels[i])
+            #                     # print("cat: ", cat)
+            #                     # print()
+            #             total_count += 1
+            #             per_cat_eval[cat][1] += 1
+            #         current_acc = correct_count/total_count
+            #         epoch_iterator.set_postfix({'acc': current_acc})
 
-            struct_pp_acc = 0
-            struct_cp_acc = 0
-            struct_obj_subj_acc = 0
+            # struct_pp_acc = 0
+            # struct_cp_acc = 0
+            # struct_obj_subj_acc = 0
 
-            lex_acc = 0
-            lex_count = 0
-            for k, v in per_cat_eval.items():
-                if k  == "pp_recursion":
-                    struct_pp_acc = 100 * v[0]/v[1]
-                elif k  == "cp_recursion":
-                    struct_cp_acc = 100 * v[0]/v[1]
-                elif k  == "obj_pp_to_subj_pp":
-                    struct_obj_subj_acc = 100 * v[0]/v[1]
-                elif k  == "subj_to_obj_proper":
-                    subj_to_obj_proper_acc = 100 * v[0]/v[1]
-                elif k  == "prim_to_obj_proper":
-                    prim_to_obj_proper_acc = 100 * v[0]/v[1]
-                elif k  == "prim_to_subj_proper": 
-                    prim_to_subj_proper_acc = 100 * v[0]/v[1]
-                else:
-                    lex_acc += v[0]
-                    lex_count += v[1]
-            lex_acc /= lex_count
-            lex_acc *= 100
-            current_acc *= 100
+            # lex_acc = 0
+            # lex_count = 0
+            # for k, v in per_cat_eval.items():
+            #     if k  == "pp_recursion":
+            #         struct_pp_acc = 100 * v[0]/v[1]
+            #     elif k  == "cp_recursion":
+            #         struct_cp_acc = 100 * v[0]/v[1]
+            #     elif k  == "obj_pp_to_subj_pp":
+            #         struct_obj_subj_acc = 100 * v[0]/v[1]
+            #     elif k  == "subj_to_obj_proper":
+            #         subj_to_obj_proper_acc = 100 * v[0]/v[1]
+            #     elif k  == "prim_to_obj_proper":
+            #         prim_to_obj_proper_acc = 100 * v[0]/v[1]
+            #     elif k  == "prim_to_subj_proper": 
+            #         prim_to_subj_proper_acc = 100 * v[0]/v[1]
+            #     else:
+            #         lex_acc += v[0]
+            #         lex_count += v[1]
+            # lex_acc /= lex_count
+            # lex_acc *= 100
+            # current_acc *= 100
 
-            print(f"obj_pp_to_subj_pp: {struct_obj_subj_acc}")
-            print(f"cp_recursion: {struct_cp_acc}")
-            print(f"pp_recursion: {struct_pp_acc}")
-            print(f"subj_to_obj_proper: {subj_to_obj_proper_acc}")
-            print(f"prim_to_obj_proper: {prim_to_obj_proper_acc}")
-            print(f"prim_to_subj_proper: {prim_to_subj_proper_acc}")
-            print(f"LEX: {lex_acc}")
-            print(f"OVERALL: {current_acc}")
+            print(result)
+
+            # print(f"obj_pp_to_subj_pp: {struct_obj_subj_acc}")
+            # print(f"cp_recursion: {struct_cp_acc}")
+            # print(f"pp_recursion: {struct_pp_acc}")
+            # print(f"subj_to_obj_proper: {subj_to_obj_proper_acc}")
+            # print(f"prim_to_obj_proper: {prim_to_obj_proper_acc}")
+            # print(f"prim_to_subj_proper: {prim_to_subj_proper_acc}")
+            # print(f"LEX: {lex_acc}")
+            # print(f"OVERALL: {current_acc}")
 
             results[f"{seed}_{data_variant}_{lf}"] = {
-                "obj_pp_to_subj_pp" : struct_obj_subj_acc,
-                "cp_recursion" : struct_cp_acc,
-                "pp_recursion" : struct_pp_acc,
-                "subj_to_obj_proper" : subj_to_obj_proper_acc,
-                "prim_to_obj_proper" : prim_to_obj_proper_acc,
-                "prim_to_subj_proper" : prim_to_subj_proper_acc,
-                "lex_acc" : lex_acc,
-                "overall_acc" : current_acc,
+                "obj_pp_to_subj_pp" : result['obj_pp_to_subj_pp'],
+                "cp_recursion" : result['cp_recursion'],
+                "pp_recursion" : result['pp_recursion'],
+                "subj_to_obj_proper" : result['subj_to_obj_proper'],
+                "prim_to_obj_proper" : result['prim_to_obj_proper'],
+                "prim_to_subj_proper" : result['prim_to_subj_proper'],
+                "lex_acc" : result['LEX'],
+                "overall_acc" : result['OVERALL'],
                 "test_acc" : test_acc
             }
 
